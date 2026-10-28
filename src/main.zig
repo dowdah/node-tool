@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const app_version = "0.1.16";
-const webtest_cache_gen_rev = "20260601_1";
+const app_version = "0.1.16-native.1";
+const webtest_cache_gen_rev = "20261028_anytls1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
@@ -4418,7 +4418,17 @@ fn materializeRuntimeArtifactsFresh(allocator: std.mem.Allocator, socket_path: [
     defer paths.deinit(allocator);
 
     try resetRuntimeArtifactOutput(paths);
-    _ = try warmJsonCache(allocator, nodes);
+    // Explicit runtime exports must not replace the global node JSON cache.
+    const private_json_dir = try std.fmt.allocPrint(allocator, "{s}/node_json", .{output_dir});
+    defer allocator.free(private_json_dir);
+    try ensureDirExistsCompat(private_json_dir);
+    for (nodes) |node| {
+        const private_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ private_json_dir, node.id });
+        defer allocator.free(private_path);
+        var file = try std.fs.cwd().createFile(private_path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(node.raw_json);
+    }
 
     var ids = std.ArrayList([]const u8){};
     defer ids.deinit(allocator);
@@ -4679,6 +4689,7 @@ fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []
         "FSS_WEBTEST_CACHE_AGG_OUTBOUNDS_FILE=\"$2/all_outbounds.json\"\n" ++
         "FSS_WEBTEST_CACHE_GLOBAL_META_FILE=\"$2/cache.meta\"\n" ++
         "WT_NODE_CACHE_DIR=\"$FSS_NODE_JSON_CACHE_DIR\"\n" ++
+        "[ ! -d \"$2/node_json\" ] || WT_NODE_CACHE_DIR=\"$2/node_json\"\n" ++
         "wt_webtest_cache_prepare_dirs || exit 1\n" ++
         "wt_init_reserved_ports\n" ++
         "wt_reset_active_node_env\n" ++
@@ -5742,18 +5753,12 @@ fn buildWebtestAnyTlsNative(allocator: std.mem.Allocator, node: NodeRecord, node
     defer allocator.free(listen_addr);
     const listen_q = try shellQuoteAlloc(allocator, listen_addr);
     defer allocator.free(listen_q);
-    const sni_arg = blk: {
-        const sni_value = if (anytls_sni) |value| value else "";
-        if (sni_value.len == 0) break :blk try allocator.dupe(u8, "");
-        const sni_q = try shellQuoteAlloc(allocator, sni_value);
-        defer allocator.free(sni_q);
-        break :blk try std.fmt.allocPrint(allocator, " -sni {s}", .{sni_q});
-    };
+    const sni_arg = try shellQuoteAlloc(allocator, if (anytls_sni) |value| value else "");
     defer allocator.free(sni_arg);
     const verify_arg = if (anytls_ai != null and std.mem.eql(u8, anytls_ai.?, "1"))
-        try allocator.dupe(u8, " --insecure")
+        try allocator.dupe(u8, "--insecure")
     else
-        try allocator.dupe(u8, " --verify");
+        try allocator.dupe(u8, "--verify");
     defer allocator.free(verify_arg);
 
     const out_json = try std.fmt.allocPrint(
@@ -5769,15 +5774,15 @@ fn buildWebtestAnyTlsNative(allocator: std.mem.Allocator, node: NodeRecord, node
     defer allocator.free(out_json);
     try writeFileAtomic(out_path, out_json);
     try writeFileAtomic(pass_path, anytls_pass.?);
+    const secret_file = try std.fs.cwd().openFile(pass_path, .{});
+    defer secret_file.close();
+    try secret_file.chmod(0o600);
 
     const start_script = try std.fmt.allocPrint(
         allocator,
         "#!/bin/sh\n" ++
-            "pid_file={s}\n" ++
-            "if [ -s \"$pid_file\" ]; then kill \"$(cat \"$pid_file\")\" >/dev/null 2>&1 || true; rm -f \"$pid_file\"; fi\n" ++
-            "\"/koolshare/bin/anytls-zig\" -server {s} --password-file {s} -l {s}{s}{s} >/dev/null 2>&1 &\n" ++
-            "echo $! > \"$pid_file\"\n",
-        .{ pid_path_q, server_addr_q, pass_path_q, listen_q, sni_arg, verify_arg },
+            "exec /bin/sh /koolshare/scripts/ss_anytls_helper.sh start {s} {s} {s} {s} {s} {s}\n",
+        .{ pid_path_q, pass_path_q, listen_q, server_addr_q, sni_arg, verify_arg },
     );
     defer allocator.free(start_script);
     try writeExecutableFileAtomic(start_path, start_script);
@@ -5785,9 +5790,8 @@ fn buildWebtestAnyTlsNative(allocator: std.mem.Allocator, node: NodeRecord, node
     const stop_script = try std.fmt.allocPrint(
         allocator,
         "#!/bin/sh\n" ++
-            "pid_file={s}\n" ++
-            "if [ -s \"$pid_file\" ]; then kill \"$(cat \"$pid_file\")\" >/dev/null 2>&1 || true; rm -f \"$pid_file\"; fi\n",
-        .{pid_path_q},
+            "exec /bin/sh /koolshare/scripts/ss_anytls_helper.sh stop {s} {s} {s}\n",
+        .{ pid_path_q, pass_path_q, listen_q },
     );
     defer allocator.free(stop_script);
     try writeExecutableFileAtomic(stop_path, stop_script);
@@ -5817,7 +5821,8 @@ fn isShuntRuntimeSupported(node: NodeRecord) bool {
     return std.mem.eql(u8, node.type_id, "3") or
         std.mem.eql(u8, node.type_id, "4") or
         std.mem.eql(u8, node.type_id, "5") or
-        std.mem.eql(u8, node.type_id, "8");
+        std.mem.eql(u8, node.type_id, "8") or
+        std.mem.eql(u8, node.type_id, "9");
 }
 
 fn runtimeArtifactProfileLabel(profile: RuntimeArtifactProfile) []const u8 {
@@ -7228,4 +7233,42 @@ test "parse skipd list body" {
     try std.testing.expect(std.mem.eql(u8, parsed.command, "list"));
     try std.testing.expect(std.mem.eql(u8, parsed.key, "fss_node_order"));
     try std.testing.expect(std.mem.eql(u8, parsed.value, "1,2,3"));
+}
+
+test "AnyTLS shunt artifacts reuse native builder and isolate secret" {
+    const allocator = std.testing.allocator;
+    var node = try parseNodeRecordFromRawJson(allocator,
+        "{\"_id\":\"12\",\"type\":\"9\",\"anytls_server\":\"example.invalid\",\"anytls_port\":\"443\",\"anytls_pass\":\"synthetic-only\",\"anytls_sni\":\"sni.invalid\"}");
+    defer node.deinit(allocator);
+    try std.testing.expect(runtimeArtifactProfileAcceptsNode(.shunt, node));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("nodes");
+    try tmp.dir.makeDir("meta");
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const nodes = try std.fmt.allocPrint(allocator, "{s}/nodes", .{root});
+    defer allocator.free(nodes);
+    const meta = try std.fmt.allocPrint(allocator, "{s}/meta", .{root});
+    defer allocator.free(meta);
+    var cfg = WebtestRuntimeConfig{
+        .linux_ver = try allocator.dupe(u8, "41"), .tfo = try allocator.dupe(u8, "0"),
+        .resolv_mode = try allocator.dupe(u8, "1"), .resolver = try allocator.dupe(u8, "-1"),
+    };
+    defer cfg.deinit(allocator);
+    try std.testing.expect(try buildWebtestAnyTlsNative(allocator, node, nodes, meta, cfg, 18199));
+    const start = try tmp.dir.readFileAlloc(allocator, "nodes/12_start.sh", 8192);
+    defer allocator.free(start);
+    try std.testing.expect(std.mem.indexOf(u8, start, "ss_anytls_helper.sh start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start, "synthetic-only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, start, "webtest_cache") == null);
+    const pass = try tmp.dir.openFile("nodes/12_anytls.pass", .{});
+    defer pass.close();
+    const stat = try pass.stat();
+    try std.testing.expectEqual(@as(u32, 0o600), stat.mode & 0o777);
+    const out = try tmp.dir.readFileAlloc(allocator, "nodes/12_outbounds.json", 8192);
+    defer allocator.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("socks", parsed.value.object.get("protocol").?.string);
 }
